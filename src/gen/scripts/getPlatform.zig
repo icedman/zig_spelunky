@@ -12,7 +12,7 @@ const Value = rt.Value;
 const sm = rt.StringManager.get;
 
 pub fn gml_script_getPlatform(self: *Instance, other: *Instance) void {
-    g.globals.html5Build = rt.b2r(!rt.eq(api.gget_os_browser(), 0.0));
+    g.globals.html5Build = 1; //rt.b2r(!rt.eq(api.gget_os_browser(), 0.0));
     g.globals.mobileBuild = rt.b2r((rt.eq(api.gget_os_type(), 5.0) or rt.eq(api.gget_os_type(), 4.0)));
     if (rt.truthy(g.globals.html5Build)) {
         g.globals.electronBuild = g.gml_ext_isElectron(self, other, &.{});

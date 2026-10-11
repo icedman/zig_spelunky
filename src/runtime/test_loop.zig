@@ -476,6 +476,8 @@ fn setup(rooms: bool) void {
     ViewManager.get().reset();
     DrawManager.get().reset();
     _ = LoopManager.get().init(s_hooks);
+    // These tests cover the full GameMaker draw pipeline (events + layers).
+    LoopManager.get().use_alt_draw = false;
     resetSwitches();
 }
 

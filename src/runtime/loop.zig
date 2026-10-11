@@ -34,6 +34,7 @@ const DrawManager = draw_mod.DrawManager;
 const sprite_mod = @import("sprite.zig");
 const math_mod = @import("math.zig");
 const profile = @import("profile.zig");
+const draw_alt = @import("draw_alt.zig");
 const SpriteRegistry = sprite_mod.SpriteRegistry;
 
 pub const EV_TYPE_ALARM: i32 = 2;
@@ -115,6 +116,8 @@ pub const LoopManager = struct {
     draw_skip_enabled: bool = false,
     draw_skip: bool = false,
     draw_filter: DrawLayerFilter = .{},
+    /// Use the simplified depth-ordered pipeline in draw_alt.zig.
+    use_alt_draw: bool = true,
     obj_flags: [MAX_OBJECTS]ObjectFlags = [_]ObjectFlags{.{}} ** MAX_OBJECTS,
     alarm_handlers: [MAX_OBJECTS]u16 = [_]u16{0} ** MAX_OBJECTS,
 
@@ -299,7 +302,7 @@ pub const LoopManager = struct {
         return true;
     }
 
-    fn handler(self: *const LoopManager, inst: *const Instance, ev_type: i32, number: i32) ?EventFn {
+    pub fn handler(self: *const LoopManager, inst: *const Instance, ev_type: i32, number: i32) ?EventFn {
         if (self.hooks) |h| {
             if (h.find_event) |fe| {
                 return fe(inst.object_index, ev_type, number);
@@ -876,7 +879,7 @@ pub const LoopManager = struct {
         const should_draw = self.is_draw_enabled and (!self.draw_skip_enabled or !self.draw_skip);
         if (should_draw) {
             t = profile.start();
-            self.drawPipeline();
+            if (self.use_alt_draw) draw_alt.drawPipeline(self) else self.drawPipeline();
             profile.stop(.draw, t);
         }
 

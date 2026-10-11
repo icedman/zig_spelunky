@@ -1,0 +1,7 @@
+name=Spelunky Classic (Zig)
+author=Derek Yu (original), icedman (Playdate port)
+description=Spelunky Classic HD, transpiled from GameMaker to Zig
+bundleID=com.github.icedman.spelunky.zig
+version=1.0.0
+buildNumber=1
+imagePath=launcher

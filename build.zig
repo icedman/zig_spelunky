@@ -3,6 +3,8 @@
 //   zig build                          builds zig-out/bin/spelunky
 //   zig build run [-- ARGS]            ...and runs it (e.g. -- --mute)
 //   zig build test                     unit tests + headless boot to the title screen
+//   zig build playdate                 builds zig-out/spelunky.pdx (Simulator + device)
+//   zig build playdate-run             ...and opens it in the Playdate Simulator
 //   -Doptimize=ReleaseFast             optimized build (default: Debug)
 
 const std = @import("std");
@@ -16,28 +18,116 @@ pub fn build(b: *std.Build) void {
     const data_dir = b.option([]const u8, "data-dir", "Default --data directory (default: <package>/data)") orelse
         b.pathFromRoot("data");
 
-    const runtime_options = b.addOptions();
-    runtime_options.addOption(usize, "max_instances", 2048);
-    runtime_options.addOption(usize, "var_count", 1024);
-    runtime_options.addOption(usize, "svar_count", 64);
-    runtime_options.addOption(usize, "vvar_count", 64);
-
-    const base: std.Build.Module.CreateOptions = .{
-        .target = target,
-        .optimize = optimize,
-        .link_libc = true,
-    };
-
-    // Core GameMaker runtime
-    const runtime = module(b, base, "src/runtime/root.zig", &.{});
-    runtime.addOptions("runtime_options", runtime_options);
+    const mods = addGame(b, .{ .target = target, .optimize = optimize });
     // HTML5-runner collision oracle data for src/runtime/test_collision.zig.
     const golden = b.addTranslateC(.{
         .root_source_file = b.path("tests/golden/collision_golden.h"),
         .target = target,
         .optimize = optimize,
     });
-    runtime.addImport("collision_golden", golden.createModule());
+    mods.runtime.addImport("collision_golden", golden.createModule());
+
+    // SDL2 host
+    const sdl = b.addTranslateC(.{
+        .root_source_file = b.path("src/host/sdl2/c.h"),
+        .target = target,
+        .optimize = optimize,
+    });
+    for ([_][]const u8{ "SDL2", "SDL2_image", "SDL2_mixer" }) |lib| sdl.linkSystemLibrary(lib, .{});
+    const host = module(b, .{ .target = target, .optimize = optimize, .link_libc = true }, "src/host/main_sdl2.zig", &.{
+        .{ .name = "runtime", .module = mods.runtime },
+        .{ .name = "app", .module = mods.app },
+        .{ .name = "assets", .module = mods.assets },
+        .{ .name = "sdl", .module = sdl.createModule() },
+    });
+    const sdl2_options = b.addOptions();
+    sdl2_options.addOption([]const u8, "assets_dir", assets_dir);
+    sdl2_options.addOption([]const u8, "data_dir", data_dir);
+    host.addOptions("sdl2_options", sdl2_options);
+
+    const exe = b.addExecutable(.{ .name = "spelunky", .root_module = host });
+    b.installArtifact(exe);
+
+    const run_cmd = b.addRunArtifact(exe);
+    run_cmd.step.dependOn(b.getInstallStep());
+    if (b.args) |args| run_cmd.addArgs(args);
+    const run_step = b.step("run", "Run the game (args after --, e.g. -- --mute)");
+    run_step.dependOn(&run_cmd.step);
+
+    // Tests: module unit tests (game/assets force analysis of every generated
+    // declaration) and a headless boot to the title screen.
+    const test_step = b.step("test", "Run the unit tests and boot headlessly to the title screen");
+    for ([_]struct { []const u8, *std.Build.Module }{
+        .{ "runtime", mods.runtime },
+        .{ "gml", mods.gml },
+        .{ "game", mods.game },
+        .{ "assets", mods.assets },
+        .{ "app", mods.app },
+        .{ "sdl2", host },
+    }) |t| {
+        const unit = b.addTest(.{ .name = t[0], .root_module = t[1] });
+        test_step.dependOn(&b.addRunArtifact(unit).step);
+    }
+    const boot = b.addRunArtifact(exe);
+    boot.setName("boot-to-title");
+    boot.addArgs(&.{ "--frames", "900", "--mute" });
+    boot.setEnvironmentVariable("SDL_VIDEODRIVER", "offscreen");
+    boot.setEnvironmentVariable("SDL_AUDIODRIVER", "dummy");
+    boot.expectStdOutMatch("room rTitle");
+    test_step.dependOn(&boot.step);
+
+    addPlaydate(b, test_step);
+}
+
+fn module(b: *std.Build, from: std.Build.Module.CreateOptions, root: []const u8, imports: []const std.Build.Module.Import) *std.Build.Module {
+    var o = from;
+    o.root_source_file = b.path(root);
+    o.imports = imports;
+    return b.createModule(o);
+}
+
+/// The game's module graph (runtime, GML glue, transpiled game, asset tables,
+/// platform-neutral host driver) for one target.
+const Game = struct {
+    runtime: *std.Build.Module,
+    gml: *std.Build.Module,
+    game: *std.Build.Module,
+    assets: *std.Build.Module,
+    app: *std.Build.Module,
+};
+
+const GameOptions = struct {
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    /// False for hosts without a C library (Playdate): they install the
+    /// runtime's file and clock backends themselves.
+    link_libc: bool = true,
+    max_instances: usize = 2048,
+    var_count: usize = 1024,
+    svar_count: usize = 64,
+    vvar_count: usize = 64,
+    single_threaded: ?bool = null,
+    pic: ?bool = null,
+};
+
+fn addGame(b: *std.Build, opt: GameOptions) Game {
+    const runtime_options = b.addOptions();
+    runtime_options.addOption(usize, "max_instances", opt.max_instances);
+    runtime_options.addOption(usize, "var_count", opt.var_count);
+    runtime_options.addOption(usize, "svar_count", opt.svar_count);
+    runtime_options.addOption(usize, "vvar_count", opt.vvar_count);
+
+    const base: std.Build.Module.CreateOptions = .{
+        .target = opt.target,
+        .optimize = opt.optimize,
+        .link_libc = opt.link_libc,
+        .single_threaded = opt.single_threaded,
+        .pic = opt.pic,
+    };
+
+    // Core GameMaker runtime
+    const runtime = module(b, base, "src/runtime/root.zig", &.{});
+    runtime.addOptions("runtime_options", runtime_options);
     // GML glue (expression semantics, events, built-in bindings)
     const gml = module(b, base, "src/gml/root.zig", &.{
         .{ .name = "runtime", .module = runtime },
@@ -60,60 +150,159 @@ pub fn build(b: *std.Build) void {
         .{ .name = "game", .module = game },
         .{ .name = "assets", .module = assets },
     });
-
-    // SDL2 host
-    const sdl = b.addTranslateC(.{
-        .root_source_file = b.path("src/host/sdl2/c.h"),
-        .target = target,
-        .optimize = optimize,
-    });
-    for ([_][]const u8{ "SDL2", "SDL2_image", "SDL2_mixer" }) |lib| sdl.linkSystemLibrary(lib, .{});
-    const host = module(b, base, "src/host/main_sdl2.zig", &.{
-        .{ .name = "runtime", .module = runtime },
-        .{ .name = "app", .module = app },
-        .{ .name = "assets", .module = assets },
-        .{ .name = "sdl", .module = sdl.createModule() },
-    });
-    const sdl2_options = b.addOptions();
-    sdl2_options.addOption([]const u8, "assets_dir", assets_dir);
-    sdl2_options.addOption([]const u8, "data_dir", data_dir);
-    host.addOptions("sdl2_options", sdl2_options);
-
-    const exe = b.addExecutable(.{ .name = "spelunky", .root_module = host });
-    b.installArtifact(exe);
-
-    const run_cmd = b.addRunArtifact(exe);
-    run_cmd.step.dependOn(b.getInstallStep());
-    if (b.args) |args| run_cmd.addArgs(args);
-    const run_step = b.step("run", "Run the game (args after --, e.g. -- --mute)");
-    run_step.dependOn(&run_cmd.step);
-
-    // Tests: module unit tests (game/assets force analysis of every generated
-    // declaration) and a headless boot to the title screen.
-    const test_step = b.step("test", "Run the unit tests and boot headlessly to the title screen");
-    for ([_]struct { []const u8, *std.Build.Module }{
-        .{ "runtime", runtime },
-        .{ "gml", gml },
-        .{ "game", game },
-        .{ "assets", assets },
-        .{ "app", app },
-        .{ "sdl2", host },
-    }) |t| {
-        const unit = b.addTest(.{ .name = t[0], .root_module = t[1] });
-        test_step.dependOn(&b.addRunArtifact(unit).step);
-    }
-    const boot = b.addRunArtifact(exe);
-    boot.setName("boot-to-title");
-    boot.addArgs(&.{ "--frames", "900", "--mute" });
-    boot.setEnvironmentVariable("SDL_VIDEODRIVER", "offscreen");
-    boot.setEnvironmentVariable("SDL_AUDIODRIVER", "dummy");
-    boot.expectStdOutMatch("room rTitle");
-    test_step.dependOn(&boot.step);
+    return .{ .runtime = runtime, .gml = gml, .game = game, .assets = assets, .app = app };
 }
 
-fn module(b: *std.Build, from: std.Build.Module.CreateOptions, root: []const u8, imports: []const std.Build.Module.Import) *std.Build.Module {
-    var o = from;
-    o.root_source_file = b.path(root);
-    o.imports = imports;
-    return b.createModule(o);
+/// Playdate host (src/host/main_playdate.zig): `zig build playdate` builds
+/// zig-out/spelunky.pdx with pdex.so (Simulator, this OS) and pdex.elf
+/// (device); `zig build playdate-run` opens it in the Simulator. Needs the
+/// Playdate SDK (PLAYDATE_SDK_PATH or -Dplaydate-sdk).
+///
+/// The 1-bit assets, datafiles, font and launcher images in playdate/Source
+/// are prebuilt by tools/playdate_assets.py (Python + Pillow + numpy +
+/// ffmpeg); re-run it only when the desktop assets change:
+///   python3 tools/playdate_assets.py --assets assets --data data --out playdate/Source
+fn addPlaydate(b: *std.Build, test_step: *std.Build.Step) void {
+    const pd_step = b.step("playdate", "Build zig-out/spelunky.pdx for the Playdate (Simulator + device)");
+    const pd_run_step = b.step("playdate-run", "Build the .pdx and run it in the Playdate Simulator");
+
+    const sdk = b.option([]const u8, "playdate-sdk", "Playdate SDK directory (default: PLAYDATE_SDK_PATH)") orelse
+        b.graph.environ_map.get("PLAYDATE_SDK_PATH");
+    // ReleaseSmall: the game runs from SDRAM behind a small instruction cache,
+    // and every byte of code is RAM the 16 MB device lacks.
+    const pd_optimize = b.option(std.builtin.OptimizeMode, "playdate-optimize", "Optimize mode of the Playdate builds (default: ReleaseSmall)") orelse .ReleaseSmall;
+    const device = b.option(bool, "playdate-device", "Also build pdex.elf for the device (default: true)") orelse true;
+    const instances = b.option(usize, "playdate-instances", "Instance pool size of the Playdate builds (default: 1024; 16 MB of RAM)") orelse 1024;
+    const host_options = b.addOptions();
+    host_options.addOption(bool, "audio", b.option(bool, "playdate-audio", "Play sound effects and music on the Playdate (default: true)") orelse true);
+    host_options.addOption(bool, "show_fps", b.option(bool, "playdate-fps", "Draw the Playdate FPS counter (default: true)") orelse true);
+    host_options.addOption(u32, "profile_frames", b.option(u32, "playdate-profile", "Log per-phase frame timings to the console every N frames (default: 0 = off)") orelse 0);
+    host_options.addOption(u32, "display_scale", b.option(u32, "playdate-scale", "Playdate display scale factor (1 = 400x240, 2 = 200x120 2x hardware upscaled, default: 2)") orelse 2);
+
+    const sdk_path = sdk orelse {
+        const fail = b.addFail("the Playdate SDK was not found: set PLAYDATE_SDK_PATH or pass -Dplaydate-sdk=DIR");
+        pd_step.dependOn(&fail.step);
+        pd_run_step.dependOn(&fail.step);
+        return;
+    };
+
+    // The Simulator loads pdex.so/.dylib/.dll built for this machine; the
+    // device runs pdex.elf (Cortex-M7, hard float). Neither links libc.
+    const host_target = b.graph.host;
+    // Zig's cortex_m7 model has no FPU: without fp_armv8d16sp (the M7's
+    // single-precision fpv5-sp-d16) every f32 operation is a soft-float call
+    // and float arguments / results to the SDK are passed in core registers.
+    const device_target = b.resolveTargetQuery(.{
+        .cpu_arch = .thumb,
+        .os_tag = .freestanding,
+        .abi = .eabihf,
+        .cpu_model = .{ .explicit = &std.Target.arm.cpu.cortex_m7 },
+        .cpu_features_add = std.Target.arm.featureSet(&.{.fp_armv8d16sp}),
+    });
+
+    // pdc's input, assembled in the cache: prebuilt assets + pdxinfo + binaries.
+    const source = b.addWriteFiles();
+    _ = source.addCopyDirectory(b.path("playdate/Source"), "", .{});
+    _ = source.addCopyFile(b.path("src/host/playdate/pdxinfo"), "pdxinfo");
+
+    const sim_lib = b.addLibrary(.{
+        .name = "pdex",
+        .linkage = .dynamic,
+        .root_module = playdateModule(b, host_target, pd_optimize, instances, host_options),
+    });
+    const lib_ext = switch (host_target.result.os.tag) {
+        .windows => "dll",
+        .macos => "dylib",
+        else => "so",
+    };
+    _ = source.addCopyFile(sim_lib.getEmittedBin(), b.fmt("pdex.{s}", .{lib_ext}));
+
+    if (device) {
+        const elf = b.addExecutable(.{
+            .name = "pdex.elf",
+            .root_module = playdateModule(b, device_target, pd_optimize, instances, host_options),
+        });
+        // pdc wants one PT_LOAD segment at address 0 and the relocations.
+        elf.link_emit_relocs = true;
+        elf.entry = .{ .symbol_name = "eventHandler" };
+        elf.setLinkerScript(b.path("src/host/playdate/link_map.ld"));
+        _ = source.addCopyFile(elf.getEmittedBin(), "pdex.elf");
+    }
+
+    const pdx = b.getInstallPath(.prefix, "spelunky.pdx");
+    const pdc = b.addSystemCommand(&.{b.pathJoin(&.{ sdk_path, "bin", if (host_target.result.os.tag == .windows) "pdc.exe" else "pdc" })});
+    pdc.addDirectoryArg(source.getDirectory());
+    pdc.addArg(pdx);
+    pdc.setName("pdc");
+    pdc.has_side_effects = true;
+    pd_step.dependOn(&pdc.step);
+
+    const sim = switch (host_target.result.os.tag) {
+        .macos => b.addSystemCommand(&.{ "open", pdx }),
+        .windows => b.addSystemCommand(&.{ b.pathJoin(&.{ sdk_path, "bin", "PlaydateSimulator.exe" }), pdx }),
+        else => b.addSystemCommand(&.{ b.pathJoin(&.{ sdk_path, "bin", "PlaydateSimulator" }), pdx }),
+    };
+    sim.setName("PlaydateSimulator");
+    sim.has_side_effects = true;
+    sim.step.dependOn(&pdc.step);
+    pd_run_step.dependOn(&sim.step);
+
+    // ABI check of the API bindings against the SDK headers (in `zig build test`).
+    const pd_c = b.addTranslateC(.{
+        .root_source_file = .{ .cwd_relative = b.pathJoin(&.{ sdk_path, "C_API", "pd_api.h" }) },
+        .target = host_target,
+        .optimize = .Debug,
+        .link_libc = true,
+    });
+    pd_c.addIncludePath(.{ .cwd_relative = b.pathJoin(&.{ sdk_path, "C_API" }) });
+    pd_c.defineCMacro("TARGET_EXTENSION", "1");
+    const api_tests = b.addTest(.{
+        .name = "playdate_api",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/host/playdate/test_api.zig"),
+            .target = host_target,
+            .imports = &.{.{ .name = "pd_c", .module = pd_c.createModule() }},
+        }),
+    });
+    test_step.dependOn(&b.addRunArtifact(api_tests).step);
+}
+
+fn playdateModule(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    instances: usize,
+    host_options: *std.Build.Step.Options,
+) *std.Build.Module {
+    const mods = addGame(b, .{
+        .target = target,
+        .optimize = optimize,
+        .link_libc = false,
+        .max_instances = instances,
+        // Sized to Spelunky (672 / 31 / 24 when written) to save RAM: each
+        // instance carries every slot.
+        .var_count = 704,
+        .svar_count = 32,
+        .vvar_count = 32,
+        .single_threaded = true,
+        .pic = true,
+    });
+    const root = b.createModule(.{
+        .root_source_file = b.path("src/host/main_playdate.zig"),
+        .target = target,
+        .optimize = optimize,
+        .single_threaded = true,
+        .pic = true,
+        // pdc needs the relocations (--emit-relocs), which stripping drops.
+        .strip = false,
+        // The Playdate's ARM core runs faster without the frame pointer.
+        .omit_frame_pointer = if (optimize == .Debug) null else true,
+        .imports = &.{
+            .{ .name = "runtime", .module = mods.runtime },
+            .{ .name = "app", .module = mods.app },
+            .{ .name = "assets", .module = mods.assets },
+        },
+    });
+    root.addOptions("playdate_options", host_options);
+    return root;
 }

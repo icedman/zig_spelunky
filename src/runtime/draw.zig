@@ -119,6 +119,13 @@ pub const DrawManager = struct {
     /// Screen draws dropped by `skip_unseen` (diagnostics).
     unseen_skipped: usize = 0,
 
+    /// HACK (draw_alt): size, in application-surface pixels, of the part of
+    /// the frame the host actually shows, centred (e.g. the Playdate at 2x
+    /// shows 200 x 120 of 320 x 240). When set, views re-centre on their
+    /// follow object and cull to this window. 0 = off.
+    follow_w: i32 = 0,
+    follow_h: i32 = 0,
+
     win_w: i32 = 640,
     win_h: i32 = 480,
     is_fullscreen: bool = false,

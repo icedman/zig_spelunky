@@ -74,6 +74,7 @@ pub const Video = struct {
         pd_mod.pd.display.setScale(s);
         // No viewport scale-down: the game still renders at 1x and the
         // hardware doubles it, so only the centre of the frame is visible.
+        self.applyFollow();
         self.pushTarget();
     }
 
@@ -106,6 +107,16 @@ pub const Video = struct {
             self.stencils[a] = bm;
         }
         pd_mod.pd.display.setScale(self.display_scale);
+        self.applyFollow();
+    }
+
+    /// At 2x only the centre screenW x screenH of the frame is shown: have
+    /// the draw pipeline keep the player in it and cull to it.
+    fn applyFollow(self: *const Video) void {
+        const dm = runtime.DrawManager.get();
+        const on = self.display_scale > 1;
+        dm.follow_w = if (on) self.screenW() else 0;
+        dm.follow_h = if (on) self.screenH() else 0;
     }
 
     pub fn deinit(self: *Video) void {

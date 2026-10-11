@@ -177,6 +177,7 @@ fn addPlaydate(b: *std.Build, test_step: *std.Build.Step) void {
     host_options.addOption(bool, "audio", b.option(bool, "playdate-audio", "Play sound effects and music on the Playdate (default: true)") orelse true);
     host_options.addOption(bool, "show_fps", b.option(bool, "playdate-fps", "Draw the Playdate FPS counter (default: true)") orelse true);
     host_options.addOption(u32, "profile_frames", b.option(u32, "playdate-profile", "Log per-phase frame timings to the console every N frames (default: 0 = off)") orelse 0);
+    host_options.addOption(bool, "profile_deep", b.option(bool, "playdate-profile-deep", "With playdate-profile: also time every object event and runtime call (default: true; false = phases and counters only, near-zero overhead)") orelse true);
     host_options.addOption(u32, "display_scale", b.option(u32, "playdate-scale", "Playdate display scale factor (1 = 400x240, 2 = 200x120 2x hardware upscaled, default: 2)") orelse 2);
 
     const sdk_path = sdk orelse {
@@ -227,6 +228,8 @@ fn addPlaydate(b: *std.Build, test_step: *std.Build.Step) void {
         elf.entry = .{ .symbol_name = "eventHandler" };
         elf.setLinkerScript(b.path("src/host/playdate/link_map.ld"));
         _ = source.addCopyFile(elf.getEmittedBin(), "pdex.elf");
+        // zig-out/spelunky.elf: symbols for addr2line on device crash logs.
+        pd_step.dependOn(&b.addInstallFile(elf.getEmittedBin(), "spelunky.elf").step);
     }
 
     const pdx = b.getInstallPath(.prefix, "spelunky.pdx");

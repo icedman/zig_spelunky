@@ -20,7 +20,9 @@ pub fn drawPipeline(lm: *LoopManager) void {
     const dm = DrawManager.get();
     const vm = ViewManager.get();
 
+    var t = profile.start();
     dm.beginFrame();
+    profile.stop(.draw_frame, t);
     vm.update();
 
     if (vm.enabled()) {
@@ -39,10 +41,14 @@ pub fn drawPipeline(lm: *LoopManager) void {
     }
 
     if (lm.draw_filter.gui) {
+        t = profile.start();
         dm.passGui();
         drawGui(lm);
+        profile.stop(.draw_gui, t);
     }
+    t = profile.start();
     dm.endFrame();
+    profile.stop(.draw_frame, t);
 }
 
 /// HACK: when the host shows only a centred `follow_w` x `follow_h` window
@@ -100,22 +106,66 @@ inline fn drawable(inst: *const Instance) bool {
     return inst.in_use and !inst.marked_for_destroy and inst.active and inst.visible;
 }
 
+const cull_margin: f32 = 32.0;
+
+/// instanceOffscreen, caching the world box of static instances (their box
+/// only changes through collision.touch, which drops the cache entry).
+fn offscreen(dm: *const DrawManager, mgr: *InstanceManager, inst: *const Instance, slot: usize) bool {
+    switch (mgr.cull_state[slot]) {
+        .box => return dm.boxOffscreen(mgr.cull_box[slot], cull_margin),
+        .none => return false,
+        .unknown => {},
+    }
+    const box = dm.instanceBox(inst);
+    if (!inst.is_dynamic) {
+        if (box) |b| {
+            mgr.cull_box[slot] = b;
+            mgr.cull_state[slot] = .box;
+        } else {
+            mgr.cull_state[slot] = .none;
+        }
+    }
+    return if (box) |b| dm.boxOffscreen(b, cull_margin) else false;
+}
+
 /// Instances come back from `drawOrder` already sorted by depth (cached depth
 /// buckets), so this is a single linear pass.
 fn drawObjects(lm: *LoopManager) void {
     const dm = DrawManager.get();
     const rm = RoomManager.get();
+    var t = profile.start();
     const n = InstanceManager.get().drawOrder(&lm.draw_scratch);
+    profile.stop(.draw_order, t);
 
+    t = profile.start();
+    defer profile.stop(.draw_instances, t);
+    const prof = profile.deepEnabled();
+    const mgr = InstanceManager.get();
     for (lm.draw_scratch[0..n]) |inst| {
+        const slot = mgr.slot(inst);
+        // Static instance with a cached box: culled from the compact table,
+        // without reading the instance.
+        if (mgr.cull_state[slot] == .box and dm.boxOffscreen(mgr.cull_box[slot], cull_margin)) {
+            profile.count(.draw_visited, 1);
+            profile.count(.draw_culled, 1);
+            continue;
+        }
         if (!drawable(inst)) continue;
-        if (dm.instanceOffscreen(inst, 32.0)) continue;
+        profile.count(.draw_visited, 1);
+        if (offscreen(dm, mgr, inst, slot)) {
+            profile.count(.draw_culled, 1);
+            continue;
+        }
 
-        if (lm.handler(inst, loop_mod.EV_TYPE_DRAW, loop_mod.EV_DRAW_NORMAL)) |fn_ptr| {
+        const t_obj = if (prof) profile.start() else 0;
+        if (lm.handlersOf(inst).draw) |fn_ptr| {
+            profile.count(.draw_events, 1);
             if (!rm.eventBlocked(inst, loop_mod.EV_TYPE_DRAW)) fn_ptr(inst, inst);
         } else if (lm.hooks) |h| {
+            profile.count(.draw_selfs, 1);
             if (h.draw_self) |ds| ds(inst);
         }
+        if (prof) profile.stopObject(.draw, inst.object_index, t_obj);
     }
 }
 
@@ -124,9 +174,13 @@ fn drawGui(lm: *LoopManager) void {
     const n = InstanceManager.get().drawOrder(&lm.draw_scratch);
 
     for (lm.draw_scratch[0..n]) |inst| {
+        // Cached handler first: most objects have no GUI event, and this
+        // avoids touching the rest of the instance for them.
+        const fn_ptr = lm.handlersOf(inst).draw_gui orelse continue;
         if (!drawable(inst)) continue;
-        if (lm.handler(inst, loop_mod.EV_TYPE_DRAW, loop_mod.EV_DRAW_GUI)) |fn_ptr| {
-            if (!rm.eventBlocked(inst, loop_mod.EV_TYPE_DRAW)) fn_ptr(inst, inst);
-        }
+        profile.count(.draw_events, 1);
+        const t_obj = profile.startSection();
+        if (!rm.eventBlocked(inst, loop_mod.EV_TYPE_DRAW)) fn_ptr(inst, inst);
+        profile.stopObject(.draw, inst.object_index, t_obj);
     }
 }

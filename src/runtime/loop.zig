@@ -96,6 +96,33 @@ pub const ObjectFlags = packed struct(u8) {
     _pad: u1 = 0,
 };
 
+/// Inherited handlers of the per-step events, resolved once per object in
+/// `init` so the step phases call them directly (no find_event per instance).
+pub const ObjectHandlers = struct {
+    step_begin: ?EventFn = null,
+    step: ?EventFn = null,
+    step_end: ?EventFn = null,
+    outside: ?EventFn = null,
+    boundary: ?EventFn = null,
+    anim_end: ?EventFn = null,
+    draw: ?EventFn = null,
+    draw_gui: ?EventFn = null,
+};
+
+const no_handlers: ObjectHandlers = .{};
+
+/// Whether any object has the event: phases nobody listens to are skipped
+/// without walking the instance list.
+const AnyHandlers = struct {
+    step_begin: bool = false,
+    step: bool = false,
+    step_end: bool = false,
+    alarms: bool = false,
+    other: bool = false,
+};
+
+const StepKind = enum { step_begin, step, step_end };
+
 pub const DrawLayerFilter = struct {
     static_background: bool = true,
     static_foreground: bool = true,
@@ -119,7 +146,10 @@ pub const LoopManager = struct {
     /// Use the simplified depth-ordered pipeline in draw_alt.zig.
     use_alt_draw: bool = true,
     obj_flags: [MAX_OBJECTS]ObjectFlags = [_]ObjectFlags{.{}} ** MAX_OBJECTS,
+    /// Bit a set = the object has an Alarm a handler.
     alarm_handlers: [MAX_OBJECTS]u16 = [_]u16{0} ** MAX_OBJECTS,
+    handlers: [MAX_OBJECTS]ObjectHandlers = [_]ObjectHandlers{.{}} ** MAX_OBJECTS,
+    any: AnyHandlers = .{},
 
     draw_scratch: [MAX_INSTANCES]*Instance = undefined,
 
@@ -267,12 +297,27 @@ pub const LoopManager = struct {
 
         @memset(&self.obj_flags, .{});
         @memset(&self.alarm_handlers, 0);
+        @memset(&self.handlers, .{});
+        self.any = .{};
         var obj_i: i32 = 0;
         while (obj_i < count) : (obj_i += 1) {
+            const fe = hooks.find_event.?;
+            const hs: ObjectHandlers = .{
+                .step_begin = fe(obj_i, EV_TYPE_STEP, EV_STEP_BEGIN),
+                .step = fe(obj_i, EV_TYPE_STEP, EV_STEP_NORMAL),
+                .step_end = fe(obj_i, EV_TYPE_STEP, EV_STEP_END),
+                .outside = fe(obj_i, EV_TYPE_OTHER, EV_OTHER_OUTSIDE),
+                .boundary = fe(obj_i, EV_TYPE_OTHER, EV_OTHER_BOUNDARY),
+                .anim_end = fe(obj_i, EV_TYPE_OTHER, EV_OTHER_ANIMATION_END),
+                .draw = fe(obj_i, EV_TYPE_DRAW, EV_DRAW_NORMAL),
+                .draw_gui = fe(obj_i, EV_TYPE_DRAW, EV_DRAW_GUI),
+            };
+            self.handlers[@intCast(obj_i)] = hs;
+
             var flags: ObjectFlags = .{};
-            flags.has_step_begin = hooks.find_event.?(obj_i, EV_TYPE_STEP, EV_STEP_BEGIN) != null;
-            flags.has_step = hooks.find_event.?(obj_i, EV_TYPE_STEP, EV_STEP_NORMAL) != null;
-            flags.has_step_end = hooks.find_event.?(obj_i, EV_TYPE_STEP, EV_STEP_END) != null;
+            flags.has_step_begin = hs.step_begin != null;
+            flags.has_step = hs.step != null;
+            flags.has_step_end = hs.step_end != null;
 
             var ah: u16 = 0;
             for (0..instance_mod.ALARM_COUNT) |a| {
@@ -292,11 +337,19 @@ pub const LoopManager = struct {
                 }
             }
 
-            flags.has_outside = hooks.find_event.?(obj_i, EV_TYPE_OTHER, EV_OTHER_OUTSIDE) != null or
-                hooks.find_event.?(obj_i, EV_TYPE_OTHER, EV_OTHER_BOUNDARY) != null;
+            flags.has_outside = hs.outside != null or hs.boundary != null;
+            // The image and Other passes only visit dynamic instances.
+            if (hs.anim_end != null or flags.has_outside or flags.has_keyboard) {
+                reg.setStatic(obj_i, false);
+            }
             flags.is_static = reg.isStatic(obj_i);
 
             self.obj_flags[@intCast(obj_i)] = flags;
+            self.any.step_begin = self.any.step_begin or flags.has_step_begin;
+            self.any.step = self.any.step or flags.has_step;
+            self.any.step_end = self.any.step_end or flags.has_step_end;
+            self.any.alarms = self.any.alarms or flags.has_alarms;
+            self.any.other = self.any.other or flags.has_outside;
         }
 
         return true;
@@ -318,24 +371,34 @@ pub const LoopManager = struct {
         }
     }
 
-    fn performAll(self: *LoopManager, ev_type: i32, number: i32) void {
+    pub inline fn handlersOf(self: *const LoopManager, inst: *const Instance) *const ObjectHandlers {
+        if (inst.object_index < 0 or inst.object_index >= MAX_OBJECTS) return &no_handlers;
+        return &self.handlers[@intCast(inst.object_index)];
+    }
+
+    /// Begin Step / Step / End Step over the instance list (newest first, as
+    /// the runner does), calling each object's cached handler directly.
+    fn stepAll(self: *LoopManager, comptime kind: StepKind) void {
+        if (!@field(self.any, @tagName(kind))) return;
         const mgr = InstanceManager.get();
+        const rm = RoomManager.get();
         const pass = mgr.passBegin();
-        var i: isize = @as(isize, @intCast(mgr.dynamicCount())) - 1;
-        while (i >= 0) : (i -= 1) {
-            const ui: usize = @intCast(i);
-            if (ui >= mgr.dynamicCount()) continue;
-            const inst = mgr.dynamicAt(ui) orelse continue;
-            if (inst.marked_for_destroy or !mgr.inPass(inst, pass) or RoomManager.get().eventBlocked(inst, ev_type)) continue;
-
-            if (ev_type == EV_TYPE_STEP) {
-                const flags = self.getFlags(inst.object_index);
-                if (number == EV_STEP_BEGIN and !flags.has_step_begin) continue;
-                if (number == EV_STEP_NORMAL and !flags.has_step) continue;
-                if (number == EV_STEP_END and !flags.has_step_end) continue;
-            }
-
-            if (self.handler(inst, ev_type, number)) |fn_ptr| {
+        const prof = profile.deepEnabled();
+        var i = mgr.dynamicCount();
+        while (i > 0) {
+            i -= 1;
+            if (i >= mgr.dynamicCount()) continue;
+            const inst = mgr.dynamicAt(i) orelse continue;
+            const fn_ptr = @field(self.handlersOf(inst), @tagName(kind)) orelse continue;
+            if (inst.marked_for_destroy or !mgr.inPass(inst, pass) or rm.eventBlocked(inst, EV_TYPE_STEP)) continue;
+            if (prof) {
+                profile.count(.step_events, 1);
+                // Read before the call: the event may change object_index.
+                const obj = inst.object_index;
+                const t0 = profile.start();
+                fn_ptr(inst, inst);
+                profile.stopObject(.step, obj, t0);
+            } else {
                 fn_ptr(inst, inst);
             }
         }
@@ -345,88 +408,64 @@ pub const LoopManager = struct {
     // instances created by an event fired mid-phase are visited too (unless
     // the pass filter excludes them).
 
-    /// RememberOldPositions + Animate (yyInstance.js L3443, L2203).
-    fn rememberOldPositions(_: *LoopManager) void {
-        const mgr = InstanceManager.get();
-        var i: usize = 0;
-        while (i < mgr.dynamicCount()) : (i += 1) {
-            const inst = mgr.dynamicAt(i) orelse continue;
-            inst.xprevious = inst.x;
-            inst.yprevious = inst.y;
-            inst.image_index += inst.image_speed;
-        }
-    }
-
-    /// UpdateImages (yyInstance.js L3602).
-    fn updateImages(self: *LoopManager) void {
-        const mgr = InstanceManager.get();
-        var i: usize = 0;
-        while (i < mgr.dynamicCount()) : (i += 1) {
-            const inst = mgr.dynamicAt(i) orelse continue;
-            if (inst.marked_for_destroy or !inst.active) continue;
-
-            const spr = SpriteRegistry.get().getSprite(inst.sprite_index);
-            const num = if (spr != null) @as(f32, @floatFromInt(spr.?.frame_count)) else 0.0;
-            if (inst.image_index >= num) {
-                inst.image_index -= num;
-                self.perform(inst, EV_TYPE_OTHER, EV_OTHER_ANIMATION_END);
-            } else if (inst.image_index < 0.0) {
-                inst.image_index += num;
-                self.perform(inst, EV_TYPE_OTHER, EV_OTHER_ANIMATION_END);
-            }
-        }
-    }
-
-    /// Fused pass: RememberOldPositions + Animate + UpdateImages.
+    /// Fused pass: RememberOldPositions + Animate + UpdateImages
+    /// (yyInstance.js L3443, L2203, L3602). Dynamic instances only: static
+    /// ones never move by themselves, show a one-frame sprite and have no
+    /// Animation End event (ObjectRegistry.classifyStaticObjects,
+    /// LoopManager.init); collision.touch promotes one that changes.
     fn updateImagesAndPositions(self: *LoopManager) void {
         const mgr = InstanceManager.get();
         var i: usize = 0;
-        while (i < mgr.activeCount()) : (i += 1) {
-            const inst = mgr.activeAt(i) orelse continue;
+        while (i < mgr.dynamicCount()) : (i += 1) {
+            const inst = mgr.dynamicAt(i) orelse continue;
             inst.xprevious = inst.x;
             inst.yprevious = inst.y;
             inst.image_index += inst.image_speed;
             if (inst.marked_for_destroy or !inst.active) continue;
-
-            const spr = SpriteRegistry.get().getSprite(inst.sprite_index);
-            const num = if (spr != null) @as(f32, @floatFromInt(spr.?.frame_count)) else 0.0;
-            if (inst.image_index >= num) {
-                inst.image_index -= num;
-                self.perform(inst, EV_TYPE_OTHER, EV_OTHER_ANIMATION_END);
-            } else if (inst.image_index < 0.0) {
-                inst.image_index += num;
-                self.perform(inst, EV_TYPE_OTHER, EV_OTHER_ANIMATION_END);
-            }
+            self.wrapImage(inst);
         }
     }
 
+    /// Wrap image_index into the sprite's frames; on wrap, run the object's
+    /// cached Animation End handler directly (no event lookup when absent).
+    inline fn wrapImage(self: *const LoopManager, inst: *Instance) void {
+        const spr = SpriteRegistry.get().getSprite(inst.sprite_index);
+        const num: f32 = if (spr) |s| @floatFromInt(s.frame_count) else 0.0;
+        if (inst.image_index >= num) {
+            inst.image_index -= num;
+        } else if (inst.image_index < 0.0) {
+            inst.image_index += num;
+        } else return;
+
+        const fn_ptr = self.handlersOf(inst).anim_end orelse return;
+        if (RoomManager.get().eventBlocked(inst, EV_TYPE_OTHER)) return;
+        fn_ptr(inst, inst);
+    }
+
+    /// Alarms: the per-object mask says which alarms have a handler, so the
+    /// handler is only looked up on the frame an alarm fires.
     fn handleAlarms(self: *LoopManager) void {
+        if (!self.any.alarms) return;
         const mgr = InstanceManager.get();
+        const rm = RoomManager.get();
         const pass = mgr.passBegin();
 
         var i: usize = 0;
         while (i < mgr.dynamicCount()) : (i += 1) {
             const inst = mgr.dynamicAt(i) orelse continue;
-            if (inst.marked_for_destroy or !mgr.inPass(inst, pass)) continue;
+            if (inst.object_index < 0 or inst.object_index >= MAX_OBJECTS) continue;
+            var mask = self.alarm_handlers[@intCast(inst.object_index)];
+            if (mask == 0 or inst.marked_for_destroy or !mgr.inPass(inst, pass)) continue;
 
-            const ah = self.alarm_handlers[@intCast(inst.object_index)];
-            if (ah == 0) continue;
-
-            var mask = ah;
             while (mask != 0) {
                 const a: usize = @ctz(mask);
                 mask &= mask - 1;
 
                 if (inst.alarms[a] < 0.0) continue;
-                const fn_ptr = self.handler(inst, EV_TYPE_ALARM, @intCast(a)) orelse continue;
-                var al: i32 = math_mod.toInt32(inst.alarms[a]);
-                if (al >= 0) {
-                    al -= 1;
-                    inst.alarms[a] = @floatFromInt(al);
-                }
-                if (al == 0 and !RoomManager.get().eventBlocked(inst, EV_TYPE_ALARM)) {
-                    fn_ptr(inst, inst);
-                }
+                const al: i32 = math_mod.toInt32(inst.alarms[a]) - 1;
+                inst.alarms[a] = @floatFromInt(al);
+                if (al != 0 or rm.eventBlocked(inst, EV_TYPE_ALARM)) continue;
+                if (self.handler(inst, EV_TYPE_ALARM, @intCast(a))) |fn_ptr| fn_ptr(inst, inst);
             }
         }
     }
@@ -484,25 +523,25 @@ pub const LoopManager = struct {
         }
     }
 
+    /// Outside Room / Intersect Boundary, with the cached handlers.
     fn handleOther(self: *LoopManager) void {
+        if (!self.any.other) return;
         const mgr = InstanceManager.get();
+        const rm = RoomManager.get();
+        const sprites = sprite_mod.SpriteRegistry.get();
         const pass = mgr.passBegin();
-        const w = RoomManager.get().getWidth();
-        const h = RoomManager.get().getHeight();
+        const w = rm.getWidth();
+        const h = rm.getHeight();
 
         var i: usize = 0;
         while (i < mgr.dynamicCount()) : (i += 1) {
             const inst = mgr.dynamicAt(i) orelse continue;
+            const hs = self.handlersOf(inst);
+            if (hs.outside == null and hs.boundary == null) continue;
             if (inst.marked_for_destroy or !mgr.inPass(inst, pass)) continue;
-            if (!self.getFlags(inst.object_index).has_outside) continue;
 
-            const has_outside = self.handler(inst, EV_TYPE_OTHER, EV_OTHER_OUTSIDE) != null;
-            const has_boundary = self.handler(inst, EV_TYPE_OTHER, EV_OTHER_BOUNDARY) != null;
-            if (!has_outside and !has_boundary) continue;
-
-            const sprites = sprite_mod.SpriteRegistry.get();
             const boxed = sprites.valid(inst.sprite_index) or sprites.valid(inst.mask_index);
-            if (has_outside) {
+            if (hs.outside) |fn_ptr| {
                 var outside: bool = false;
                 if (boxed) {
                     _ = collision_mod.updateBbox(inst);
@@ -510,12 +549,13 @@ pub const LoopManager = struct {
                 } else {
                     outside = inst.x < 0.0 or inst.x > w or inst.y < 0.0 or inst.y > h;
                 }
-                if (outside and !inst.outside_room) {
-                    self.perform(inst, EV_TYPE_OTHER, EV_OTHER_OUTSIDE);
+                if (outside and !inst.outside_room and !rm.eventBlocked(inst, EV_TYPE_OTHER)) {
+                    fn_ptr(inst, inst);
                 }
                 inst.outside_room = outside;
             }
-            if (has_boundary) {
+            // Re-read: the Outside event may have changed the object.
+            if (self.handlersOf(inst).boundary) |fn_ptr| {
                 var crossing: bool = false;
                 if (boxed) {
                     _ = collision_mod.updateBbox(inst);
@@ -523,8 +563,8 @@ pub const LoopManager = struct {
                 } else {
                     crossing = inst.x < 0.0 or inst.x > w or inst.y < 0.0 or inst.y > h;
                 }
-                if (crossing) {
-                    self.perform(inst, EV_TYPE_OTHER, EV_OTHER_BOUNDARY);
+                if (crossing and !rm.eventBlocked(inst, EV_TYPE_OTHER)) {
+                    fn_ptr(inst, inst);
                 }
             }
         }
@@ -836,7 +876,7 @@ pub const LoopManager = struct {
 
         t = profile.start();
         LayerManager.get().update();
-        self.performAll(EV_TYPE_STEP, EV_STEP_BEGIN);
+        self.stepAll(.step_begin);
         if (RoomManager.get().pending() != ROOM_NONE) return;
         profile.stop(.begin_step, t);
 
@@ -851,7 +891,7 @@ pub const LoopManager = struct {
         profile.stop(.keyboard, t);
 
         t = profile.start();
-        self.performAll(EV_TYPE_STEP, EV_STEP_NORMAL);
+        self.stepAll(.step);
         if (RoomManager.get().pending() != ROOM_NONE) return;
         profile.stop(.step, t);
 
@@ -869,7 +909,7 @@ pub const LoopManager = struct {
         profile.stop(.collisions, t);
 
         t = profile.start();
-        self.performAll(EV_TYPE_STEP, EV_STEP_END);
+        self.stepAll(.step_end);
         if (RoomManager.get().pending() != ROOM_NONE) return;
         profile.stop(.end_step, t);
 

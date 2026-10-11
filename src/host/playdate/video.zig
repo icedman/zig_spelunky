@@ -593,6 +593,7 @@ fn drawImage(
 fn drawRect(ud: ?*anyopaque, x1: f32, y1: f32, x2: f32, y2: f32, col: u32, alpha: f32, outline: bool) void {
     const v = self_(ud);
     if (alphaLevel(alpha) == 0) return;
+    runtime.profile.count(.draw_rects, 1);
     const x = ifloor(@min(x1, x2));
     const y = ifloor(@min(y1, y2));
     const w = ifloor(@abs(x2 - x1)) + 1;
@@ -604,6 +605,7 @@ fn drawRect(ud: ?*anyopaque, x1: f32, y1: f32, x2: f32, y2: f32, col: u32, alpha
 fn drawCircle(ud: ?*anyopaque, x: f32, y: f32, r: f32, col: u32, alpha: f32, outline: bool) void {
     const v = self_(ud);
     if (r <= 0.0 or alphaLevel(alpha) == 0) return;
+    runtime.profile.count(.draw_circles, 1);
     const d = iround(r * 2.0);
     const left = iround(x - r);
     const top = iround(y - r);
@@ -640,6 +642,7 @@ fn surfaceFree(ud: ?*anyopaque, s: i32) void {
 
 fn surfaceTarget(ud: ?*anyopaque, s: i32) void {
     const v = self_(ud);
+    runtime.profile.count(.surface_targets, 1);
     v.target = if (v.surfaceAt(s) != null) s else 0;
     v.pushTarget();
 }
@@ -649,6 +652,7 @@ fn drawSurface(ud: ?*anyopaque, s: i32, x: f32, y: f32, w: f32, h: f32, alpha: f
     const bm = v.surfaceAt(s) orelse return;
     if (!v.beginAlpha(alpha)) return;
     defer v.endAlpha();
+    runtime.profile.count(.draw_surfaces, 1);
     const size = v.surface_size[@intCast(s)];
     const gfx = pd_mod.pd.graphics;
     v.setDrawMode(.DrawModeCopy);

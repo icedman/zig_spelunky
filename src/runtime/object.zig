@@ -2,6 +2,7 @@
 //! Follows reference/GameMaker-HTML5/scripts/yyObject.js and packaged_src/src/runtime/gm_object.h.
 
 const std = @import("std");
+const sprite_mod = @import("sprite.zig");
 
 pub const MAX_OBJECTS: usize = 1024;
 pub const MAX_ANCESTOR_LEVELS: usize = 4;
@@ -160,10 +161,17 @@ pub const ObjectRegistry = struct {
                     if (has_update) break;
                 }
             }
-            if (!has_update) {
+            // Static instances skip the image pass, so their image_index never
+            // advances: an animated default sprite needs the dynamic path.
+            if (!has_update and !animatedSprite(def.default_sprite)) {
                 self.setStatic(obj, true);
             }
         }
+    }
+
+    fn animatedSprite(sprite: i32) bool {
+        const spr = sprite_mod.SpriteRegistry.get().getSprite(sprite) orelse return false;
+        return spr.frame_count > 1;
     }
 
     pub fn classifyStaticSolids(self: *ObjectRegistry) void {

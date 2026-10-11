@@ -476,7 +476,11 @@ pub const RoomManager = struct {
         self.caption[0] = 0;
         self.caption_len = 0;
 
-        collision_mod.configureGrid(self.width, self.height, 32.0);
+        // 16: the game's tile size, so a tile fills one cell and the
+        // 1-pixel collision probes of the movement scripts see 1-2
+        // candidates instead of up to 4 per cell (a few large solids, like
+        // Olmec, go to the always-tested oversize list instead).
+        collision_mod.configureGrid(self.width, self.height, 16.0);
         ViewManager.get().roomStart(room, r);
         LayerManager.get().roomStart(r);
 

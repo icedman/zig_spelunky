@@ -341,7 +341,21 @@ pub const DrawManager = struct {
     }
 
     pub fn offscreenMargin(self: *const DrawManager, x: f32, y: f32, xo: f32, yo: f32, w: f32, h: f32, xs: f32, ys: f32, angle: f32, margin: f32) bool {
+        return self.boxOffscreen(imageBox(x, y, xo, yo, w, h, xs, ys, angle), margin);
+    }
+
+    /// True if a world box (left, top, right, bottom) cannot touch the
+    /// visible world rectangle of the current pass, with `margin`.
+    /// NaN-safe: any comparison with NaN is false, so the box is kept.
+    pub inline fn boxOffscreen(self: *const DrawManager, box: [4]f32, margin: f32) bool {
         if (!(self.xf.ww > 0.0 and self.xf.wh > 0.0)) return false;
+        return box[2] < self.xf.wx - margin or box[0] > self.xf.wx + self.xf.ww + margin or
+            box[3] < self.xf.wy - margin or box[1] > self.xf.wy + self.xf.wh + margin;
+    }
+
+    /// World box of an image; rotated images use the circle around the
+    /// origin that holds every corner.
+    fn imageBox(x: f32, y: f32, xo: f32, yo: f32, w: f32, h: f32, xs: f32, ys: f32, angle: f32) [4]f32 {
         var l: f32 = undefined;
         var r: f32 = undefined;
         var t: f32 = undefined;
@@ -364,16 +378,20 @@ pub const DrawManager = struct {
             t = y - rad;
             b = y + rad;
         }
-
-        // NaN-safe: any comparison with NaN is false, so the image is kept.
-        return r < self.xf.wx - margin or l > self.xf.wx + self.xf.ww + margin or
-            b < self.xf.wy - margin or t > self.xf.wy + self.xf.wh + margin;
+        return .{ l, t, r, b };
     }
 
     /// True if an instance's sprite bounds cannot touch the visible viewport (with margin).
     /// Instances without a sprite or with invalid dimensions return false (not culled).
     pub fn instanceOffscreen(self: *const DrawManager, inst: *const Instance, margin: f32) bool {
         if (!(self.xf.ww > 0.0 and self.xf.wh > 0.0)) return false;
+        const box = self.instanceBox(inst) orelse return false;
+        return self.boxOffscreen(box, margin);
+    }
+
+    /// World box of an instance's sprite (null: no sprite / unknown size,
+    /// never culled).
+    pub fn instanceBox(self: *const DrawManager, inst: *const Instance) ?[4]f32 {
         const sprite = inst.sprite_index;
         var w: f32 = 0.0;
         var h: f32 = 0.0;
@@ -381,33 +399,22 @@ pub const DrawManager = struct {
         var yo: f32 = 0.0;
         if (sprite >= 0 and @as(usize, @intCast(sprite)) < MAX_SPRITES) {
             if (SpriteRegistry.get().getSprite(sprite)) |spr| {
-                if (spr.frame_count <= 0 or spr.width <= 0 or spr.height <= 0) return false;
+                if (spr.frame_count <= 0 or spr.width <= 0 or spr.height <= 0) return null;
                 w = @floatFromInt(spr.width);
                 h = @floatFromInt(spr.height);
                 xo = @floatFromInt(spr.xorigin);
                 yo = @floatFromInt(spr.yorigin);
-            } else return false;
+            } else return null;
         } else if (sprite >= @as(i32, @intCast(MAX_SPRITES)) and @as(usize, @intCast(sprite - @as(i32, @intCast(MAX_SPRITES)))) < ADDED_SPRITE_MAX) {
             const added = &self.added_sprites[@intCast(sprite - @as(i32, @intCast(MAX_SPRITES)))];
-            if (!added.used or added.frames <= 0 or added.w <= 0 or added.h <= 0) return false;
+            if (!added.used or added.frames <= 0 or added.w <= 0 or added.h <= 0) return null;
             w = @floatFromInt(added.w);
             h = @floatFromInt(added.h);
             xo = added.xorig;
             yo = added.yorig;
-        } else return false;
+        } else return null;
 
-        return self.offscreenMargin(
-            inst.x,
-            inst.y,
-            xo,
-            yo,
-            w,
-            h,
-            inst.image_xscale,
-            inst.image_yscale,
-            inst.image_angle,
-            margin,
-        );
+        return imageBox(inst.x, inst.y, xo, yo, w, h, inst.image_xscale, inst.image_yscale, inst.image_angle);
     }
 
     pub fn drawSpriteExt(

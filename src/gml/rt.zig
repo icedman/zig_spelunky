@@ -330,6 +330,8 @@ pub fn deref(t_real: f32, self: *Instance, other: *Instance) ?*Instance {
         return mgr.findById(t);
     }
     if (!runtime.ObjectRegistry.get().valid(t)) return null;
+    const t0 = runtime.profile.startSection();
+    defer runtime.profile.stopSection(.deref_obj, t0);
     var c: instance.InstanceCursor = .{};
     mgr.searchBegin(&c, t);
     var first_child: ?*Instance = null;

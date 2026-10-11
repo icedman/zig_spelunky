@@ -953,14 +953,28 @@ pub fn isIndexed(object_index: i32) bool {
 /// Re-buckets `inst` if it is grid-indexed and its bbox changed. Cheap no-op
 /// for other instances. Call after writing a bbox input.
 pub fn touch(inst: *Instance) void {
+    mgr().cullForget(inst);
+    if (!inst.is_dynamic) promoteIfChanged(inst);
     if (s.cs[slotOf(inst)].in_grid) gridRefresh(inst);
 }
 
+/// Static instances skip the per-step image pass (xprevious/yprevious,
+/// image_index). One that code moves or gives an animated sprite joins the
+/// dynamic list so those keep updating. Every built-in setter of x, y,
+/// sprite_index etc. ends here.
+fn promoteIfChanged(inst: *Instance) void {
+    const moved = inst.x != inst.xprevious or inst.y != inst.yprevious;
+    const animated = if (SpriteRegistry.get().getSprite(inst.sprite_index)) |spr| spr.frame_count > 1 else false;
+    if (moved or animated) mgr().promoteDynamic(inst);
+}
+
 /// Re-buckets every indexed instance whose bbox changed.
+/// Static instances are skipped: they only move through `touch`, which
+/// refreshes their cells (and promotes them to dynamic).
 pub fn gridSync() void {
     const m = mgr();
-    for (0..m.activeCount()) |i| {
-        const inst = m.activeAt(i).?;
+    for (0..m.dynamicCount()) |i| {
+        const inst = m.dynamicAt(i) orelse continue;
         const cs = &s.cs[slotOf(inst)];
         if (!cs.in_grid) continue;
         if (inst.x == inst.xprevious and inst.y == inst.yprevious and !cs.cells_stale) continue;
@@ -1151,10 +1165,13 @@ pub fn queryGridCandidates(inst: *Instance, target: i32, out: []*Instance) ?usiz
 
 fn runQuery(q: *const Query, target: i32, x0: f32, y0: f32, x1: f32, y1: f32) ?*Instance {
     profile.count(.queries, 1);
+    const t0 = profile.startSection();
+    defer profile.stopSection(.query, t0);
     if (queryGrid(q, target, x0, y0, x1, y1)) |hit| {
         if (s.verify and queryLinear(q, target) != hit) s.verify_failures += 1;
         return hit;
     }
+    profile.count(.query_linear, 1);
     return queryLinear(q, target);
 }
 
@@ -1207,11 +1224,14 @@ pub fn positionMeeting(x: f32, y: f32, target: i32) bool {
 pub fn moveSnap(inst: *Instance, hsnap: f32, vsnap: f32) void {
     if (hsnap > 0.0) inst.x = @round(inst.x / hsnap) * hsnap;
     if (vsnap > 0.0) inst.y = @round(inst.y / vsnap) * vsnap;
+    touch(inst);
 }
 
 /// distance_to_object (Function_Movement.js L902) via Instance_SearchLoop2:
 /// bbox gap to the nearest match (self included); NO_DISTANCE when none.
 pub fn distanceToObject(self: *Instance, target: i32) f32 {
+    const t0 = profile.startSection();
+    defer profile.stopSection(.distance, t0);
     var dist: f32 = NO_DISTANCE;
     _ = ensureBbox(self);
     const sb = bboxOf(self);

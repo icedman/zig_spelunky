@@ -1064,6 +1064,8 @@ fn audio() *runtime.AudioManager {
 }
 
 pub fn audio_play_sound(_: *Instance, _: *Instance, snd: f32, prio: f32, loop: f32) f32 {
+    const t0 = runtime.profile.startSection();
+    defer runtime.profile.stopSection(.sound, t0);
     return audio().playSound(snd, prio, b2r(truthy(loop)));
 }
 

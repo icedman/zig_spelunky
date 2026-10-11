@@ -8,6 +8,7 @@ const StringManager = @import("string.zig").StringManager;
 const object_mod = @import("object.zig");
 const ObjectRegistry = object_mod.ObjectRegistry;
 const room = @import("room.zig");
+const profile = @import("profile.zig");
 
 /// Instance pool size: 2048 (the C port's GM_INSTANCE_MAX); smaller where
 /// RAM is short (the Playdate builds use 1024, like its C build). Set by
@@ -77,6 +78,10 @@ pub const VariableSlab = struct {
 };
 
 pub var dummy_slab: VariableSlab = .{};
+
+/// InstanceManager.cull_state: whether `cull_box` holds a static
+/// instance's draw box (`none`: no sprite box, never culled).
+pub const CullState = enum(u8) { unknown, box, none };
 
 pub const Instance = struct {
     id: i32 = 0,
@@ -224,6 +229,8 @@ pub const Instance = struct {
             const mgr = InstanceManager.get();
             self.layer_serial = mgr.nextLayerSerial();
             mgr.draw_dirty = true;
+            // Pool instances only (tests may use stack instances).
+            if (mgr.owns(self)) mgr.depth_bucket[mgr.slot(self)] = InstanceManager.depthBucket(d);
         }
         self.depth = d;
     }
@@ -334,6 +341,18 @@ pub const InstanceManager = struct {
     last_draw_count: usize = 0,
     marked_count: usize = 0,
 
+    /// Draw-cull world boxes of static instances, by slot: the draw pass
+    /// culls them from this compact table without reading the instance.
+    /// Dropped by `cullForget` (collision.touch, add, promote/demote).
+    cull_box: [MAX_INSTANCES][4]f32 = undefined,
+    cull_state: [MAX_INSTANCES]CullState = @splat(.unknown),
+    /// Draw bucket of each slot's depth (depthBucket), kept by addInstance
+    /// and Instance.setDepth, the only writers of `depth`.
+    depth_bucket: [MAX_INSTANCES]u8 = @splat(0),
+    /// Mirror of each slot's `marked_for_destroy` (set by `destroy`, the
+    /// only writer), so reclaim finds marked instances without reading all.
+    marked_slot: [MAX_INSTANCES]bool = @splat(false),
+
     pass_counter: u32 = 0,
     layer_serial_counter: u32 = 0,
     link_serial_counter: u32 = 0,
@@ -402,6 +421,7 @@ pub const InstanceManager = struct {
         @memset(&self.direct_id, ID_EMPTY);
         self.next_id = INSTANCE_ID_BASE;
         self.marked_count = 0;
+        @memset(&self.marked_slot, false);
         self.pass_counter = 0;
         self.layer_serial_counter = 0;
         self.link_serial_counter = 0;
@@ -574,6 +594,9 @@ pub const InstanceManager = struct {
         self.hookEnter(inst);
 
         inst.is_dynamic = !ObjectRegistry.get().isStatic(obj_index);
+        self.cull_state[slot_idx] = .unknown;
+        self.depth_bucket[slot_idx] = depthBucket(inst.depth);
+        self.marked_slot[slot_idx] = false;
         if (inst.is_dynamic) {
             self.active_dynamic[self.dynamic_count] = inst;
             self.dynamic_count += 1;
@@ -606,6 +629,8 @@ pub const InstanceManager = struct {
     /// instance_create_depth: adds the instance, then runs its (inherited)
     /// Create event unless a pending room switch gates it.
     pub fn createDepth(self: *InstanceManager, x: f32, y: f32, depth: f32, obj_index: i32) ?*Instance {
+        const t0 = profile.startSection();
+        defer profile.stopSection(.create, t0);
         const inst = self.add(x, y, depth, obj_index) orelse return null;
         if (ObjectRegistry.get().findEvent(obj_index, .create, 0)) |create_fn| {
             if (!room.RoomManager.get().eventBlocked(inst, room.EVENT_TYPE_CREATE)) create_fn(inst, inst);
@@ -632,6 +657,7 @@ pub const InstanceManager = struct {
         }
         listRemove(&self.all_instances, &self.all_count, inst);
         if (inst.marked_for_destroy and self.marked_count > 0) self.marked_count -= 1;
+        self.marked_slot[self.slot(inst)] = false;
         self.idRemove(inst.id);
         releaseOwned(inst);
         inst.in_use = false;
@@ -677,13 +703,18 @@ pub const InstanceManager = struct {
             if (!room.RoomManager.get().eventBlocked(inst, room.EVENT_TYPE_DESTROY)) destroy_fn(inst, inst);
         }
         inst.marked_for_destroy = true;
+        self.marked_slot[self.slot(inst)] = true;
         self.marked_count += 1;
     }
 
-    fn compactUnmarked(list: []*Instance, len: *usize) void {
+    inline fn isMarked(self: *const InstanceManager, inst: *const Instance) bool {
+        return self.marked_slot[self.slot(inst)];
+    }
+
+    fn compactUnmarked(self: *const InstanceManager, list: []*Instance, len: *usize) void {
         var n: usize = 0;
         for (list[0..len.*]) |inst| {
-            if (!inst.marked_for_destroy) {
+            if (!self.isMarked(inst)) {
                 list[n] = inst;
                 n += 1;
             }
@@ -692,11 +723,12 @@ pub const InstanceManager = struct {
     }
 
     /// gm_instance_reclaim_marked: frees every marked instance (in creation
-    /// order) and returns how many.
+    /// order) and returns how many. Marks are read from the slot-indexed
+    /// `marked_slot` table: only the marked instances themselves are touched.
     pub fn reclaimMarked(self: *InstanceManager) usize {
         if (self.marked_count == 0) return 0;
         for (self.all_instances[0..self.all_count]) |inst| {
-            if (inst.marked_for_destroy) {
+            if (self.isMarked(inst)) {
                 if (inst.active) {
                     self.hookLeave(inst);
                     self.typeUnlinkAll(inst);
@@ -704,19 +736,20 @@ pub const InstanceManager = struct {
                 self.idRemove(inst.id);
             }
         }
-        compactUnmarked(&self.active_instances, &self.active_count);
-        compactUnmarked(&self.active_dynamic, &self.dynamic_count);
-        compactUnmarked(&self.active_static, &self.static_count);
-        compactUnmarked(&self.deactive_instances, &self.deactive_count);
+        self.compactUnmarked(&self.active_instances, &self.active_count);
+        self.compactUnmarked(&self.active_dynamic, &self.dynamic_count);
+        self.compactUnmarked(&self.active_static, &self.static_count);
+        self.compactUnmarked(&self.deactive_instances, &self.deactive_count);
         self.draw_dirty = true;
         var n: usize = 0;
         var removed: usize = 0;
         for (self.all_instances[0..self.all_count]) |inst| {
-            if (inst.marked_for_destroy) {
+            if (self.isMarked(inst)) {
                 releaseOwned(inst);
                 inst.in_use = false;
                 inst.active = false;
                 inst.marked_for_destroy = false;
+                self.marked_slot[self.slot(inst)] = false;
                 self.free[self.free_count] = @intCast(self.slot(inst));
                 self.free_count += 1;
                 removed += 1;
@@ -842,6 +875,7 @@ pub const InstanceManager = struct {
     pub fn promoteDynamic(self: *InstanceManager, inst: *Instance) void {
         if (inst.is_dynamic) return;
         inst.is_dynamic = true;
+        self.cullForget(inst);
         if (inst.active) {
             listRemove(&self.active_static, &self.static_count, inst);
             if (self.dynamic_count < MAX_INSTANCES) {
@@ -854,6 +888,7 @@ pub const InstanceManager = struct {
     pub fn demoteStatic(self: *InstanceManager, inst: *Instance) void {
         if (!inst.is_dynamic) return;
         inst.is_dynamic = false;
+        self.cullForget(inst);
         if (inst.active) {
             listRemove(&self.active_dynamic, &self.dynamic_count, inst);
             if (self.static_count < MAX_INSTANCES) {
@@ -919,6 +954,18 @@ pub const InstanceManager = struct {
         const base = @intFromPtr(&self.pool[0]);
         const addr = @intFromPtr(inst);
         return (addr - base) / @sizeOf(Instance);
+    }
+
+    /// True if `inst` lives in the instance pool.
+    pub fn owns(self: *const InstanceManager, inst: *const Instance) bool {
+        const base = @intFromPtr(&self.pool[0]);
+        const addr = @intFromPtr(inst);
+        return addr >= base and addr < base + @sizeOf(@TypeOf(self.pool));
+    }
+
+    /// The cached draw-cull box of `inst` (if any) no longer holds.
+    pub inline fn cullForget(self: *InstanceManager, inst: *const Instance) void {
+        self.cull_state[self.slot(inst)] = .unknown;
     }
 
     pub fn atSlot(self: *InstanceManager, s: usize) ?*Instance {
@@ -1026,6 +1073,8 @@ pub const InstanceManager = struct {
     /// (self, other): self, other, an id, all, or an object (with children).
     pub fn find(self: *InstanceManager, target: i32, n: i32, self_inst: ?*Instance, other_inst: ?*Instance) ?*Instance {
         if (n < 0) return null;
+        const t0 = profile.startSection();
+        defer profile.stopSection(.lookup, t0);
         var c: InstanceCursor = .{};
         self.cursorInit(&c, target, self_inst, other_inst);
         var left = n;
@@ -1042,6 +1091,8 @@ pub const InstanceManager = struct {
 
     /// instance_number: usable instances the target denotes.
     pub fn number(self: *InstanceManager, target: i32, self_inst: ?*Instance, other_inst: ?*Instance) usize {
+        const t0 = profile.startSection();
+        defer profile.stopSection(.lookup, t0);
         if (target == GM_ALL and self.active_count == 0) return 0;
         if (target >= INSTANCE_ID_BASE) {
             if (self.findById(target)) |inst| {
@@ -1082,6 +1133,8 @@ pub const InstanceManager = struct {
     /// with(): the usable instances a target denotes, in iteration order.
     /// Null when the set does not fit `out` (gm_instance_with_snapshot's -1).
     pub fn withSnapshot(self: *InstanceManager, target: i32, self_inst: ?*Instance, other_inst: ?*Instance, out: []*Instance) ?usize {
+        const t0 = profile.startSection();
+        defer profile.stopSection(.with, t0);
         var c: InstanceCursor = .{};
         self.cursorInit(&c, target, self_inst, other_inst);
         var n: usize = 0;
@@ -1117,6 +1170,8 @@ pub const InstanceManager = struct {
     /// by squared distance; the first one wins ties. `all` walks the
     /// creation-order list; objects and ids the cursor.
     pub fn nearest(self: *InstanceManager, x: f32, y: f32, target: i32) ?*Instance {
+        const t0 = profile.startSection();
+        defer profile.stopSection(.nearest, t0);
         var best: f32 = 10000000000.0;
         var found: ?*Instance = null;
         if (target == GM_ALL) {
@@ -1156,130 +1211,63 @@ pub const InstanceManager = struct {
         return &self.pool[@intCast(self.id_table[i])];
     }
 
-    fn drawsBefore(a: *const Instance, b: *const Instance) bool {
-        const da = @floor(a.depth);
-        const db = @floor(b.depth);
-        if (da != db) {
-            return da > db;
+    /// Draw buckets, deepest first: every depth the game's objects use.
+    /// Depths not listed share the bucket of the next shallower entry.
+    const bucket_depths = [_]i32{
+        1000000000, 99999999, 9999999, 999999, 99999, 10000, 9999, 9003, 9000, 8999,
+        1000,       999,      998,     997,    995,   900,   201,  200,  150,  120,
+        110,        108,      101,     100,    99,    60,    55,   51,   50,   49,
+        40,         30,       20,      10,     2,     1,     0,    -2,   -10,  -999999,
+        -99999991,
+    };
+    const BUCKET_COUNT: usize = bucket_depths.len;
+
+    fn depthBucket(depth: f32) u8 {
+        const d = math.toInt32(@floor(depth));
+        for (bucket_depths, 0..) |bd, b| {
+            if (d >= bd) return @intCast(b);
         }
-        return a.layer_serial > b.layer_serial;
+        return BUCKET_COUNT - 1;
     }
 
-    const BUCKET_COUNT: usize = 16;
-
-    inline fn depthBucket(d: i32) ?u8 {
-        return switch (d) {
-            1000000000 => 0,
-            1000 => 1,
-            999 => 2,
-            995 => 3,
-            120 => 4,
-            101 => 5,
-            100 => 6,
-            60 => 7,
-            55 => 8,
-            51 => 9,
-            50 => 10,
-            49 => 11,
-            40 => 12,
-            1 => 13,
-            0 => 14,
-            -10 => 15,
-            else => null,
-        };
-    }
-
-    fn sortFallback(self: *InstanceManager, n: usize) void {
-        @memcpy(self.draw_sorted[0..n], self.active_instances[0..n]);
-        std.sort.block(*Instance, self.draw_sorted[0..n], {}, struct {
-            fn lessThan(_: void, a: *Instance, b: *Instance) bool {
-                return drawsBefore(a, b);
-            }
-        }.lessThan);
-        self.draw_sorted_count = n;
-    }
-
+    /// Counting sort into depth buckets, no comparison sort. Within a bucket,
+    /// newer instances (later in the active list) draw first. Buckets come
+    /// from the slot-indexed `depth_bucket` table, so no instance is read.
     fn rebuildDrawOrder(self: *InstanceManager) void {
-        const n = self.active_count;
-        if (n <= 1) {
-            if (n == 1) self.draw_sorted[0] = self.active_instances[0];
-            self.draw_sorted_count = n;
-            return;
-        }
+        const S = struct {
+            var bucket_of: [MAX_INSTANCES]u8 = undefined;
+        };
+        const n = @min(self.active_count, MAX_INSTANCES);
 
         var counts = [_]u16{0} ** BUCKET_COUNT;
-        for (self.active_instances[0..n]) |inst| {
-            const fd: i32 = math.toInt32(@floor(inst.depth));
-            const b = depthBucket(fd) orelse {
-                self.sortFallback(n);
-                return;
-            };
+        for (self.active_instances[0..n], 0..) |inst, i| {
+            const b = self.depth_bucket[self.slot(inst)];
+            S.bucket_of[i] = b;
             counts[b] += 1;
         }
 
         var offsets: [BUCKET_COUNT]u16 = undefined;
-        var start_offsets: [BUCKET_COUNT]u16 = undefined;
         var curr: u16 = 0;
-        for (0..BUCKET_COUNT) |b2| {
-            offsets[b2] = curr;
-            start_offsets[b2] = curr;
-            curr += counts[b2];
+        for (0..BUCKET_COUNT) |b| {
+            offsets[b] = curr;
+            curr += counts[b];
         }
 
-        // Reverse pass over active_instances places newer instances (higher layer_serial) first
         var i: usize = n;
         while (i > 0) {
             i -= 1;
-            const inst = self.active_instances[i];
-            const fd: i32 = math.toInt32(@floor(inst.depth));
-            const b = depthBucket(fd).?;
-            self.draw_sorted[offsets[b]] = inst;
+            const b = S.bucket_of[i];
+            self.draw_sorted[offsets[b]] = self.active_instances[i];
             offsets[b] += 1;
-        }
-
-        // Verify layer_serial descending tie-breaker for buckets with multiple instances
-        for (0..BUCKET_COUNT) |b3| {
-            const b_len = counts[b3];
-            if (b_len > 1) {
-                const s = start_offsets[b3];
-                const slice = self.draw_sorted[s .. s + b_len];
-                // Check if already in descending order of layer_serial
-                var sorted = true;
-                for (0..b_len - 1) |k| {
-                    if (slice[k].layer_serial < slice[k + 1].layer_serial) {
-                        sorted = false;
-                        break;
-                    }
-                }
-                if (!sorted) {
-                    if (b_len > 16) {
-                        std.sort.pdq(*Instance, slice, {}, struct {
-                            fn lessThan(_: void, a: *Instance, b: *Instance) bool {
-                                return a.layer_serial > b.layer_serial;
-                            }
-                        }.lessThan);
-                    } else {
-                        var k: usize = 1;
-                        while (k < b_len) : (k += 1) {
-                            const item = slice[k];
-                            var j: usize = k;
-                            while (j > 0 and slice[j - 1].layer_serial < item.layer_serial) : (j -= 1) {
-                                slice[j] = slice[j - 1];
-                            }
-                            slice[j] = item;
-                        }
-                    }
-                }
-            }
         }
 
         self.draw_sorted_count = n;
     }
 
-    /// Unmarked active instances in draw order (stable on the active list).
-    /// The sort is cached: most frames call this several times (one per draw
+    /// Unmarked active instances in draw order (depth buckets).
+    /// The order is cached: most frames call this several times (one per draw
     /// event and view) with no change in between. Filtering marked instances
-    /// after a stable sort gives the same order as filtering before.
+    /// after bucketing gives the same order as filtering before.
     pub fn drawOrder(self: *InstanceManager, out: []*Instance) usize {
         if (!self.draw_dirty and self.last_draw_out == out.ptr and self.marked_count == 0) {
             return self.last_draw_count;
@@ -1288,6 +1276,16 @@ pub const InstanceManager = struct {
         if (self.draw_dirty) {
             self.rebuildDrawOrder();
             self.draw_dirty = false;
+        }
+
+        // Nothing marked (the usual case at draw time: reclaim runs first):
+        // a plain copy, without reading every instance's flag.
+        if (self.marked_count == 0) {
+            const n = @min(self.draw_sorted_count, out.len);
+            @memcpy(out[0..n], self.draw_sorted[0..n]);
+            self.last_draw_out = out.ptr;
+            self.last_draw_count = n;
+            return n;
         }
 
         var n: usize = 0;

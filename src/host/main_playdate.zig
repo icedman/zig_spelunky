@@ -73,6 +73,8 @@ fn init(playdate: *api.PlaydateAPI) void {
     video.show_fps = options.show_fps;
     if (options.profile_frames > 0) {
         runtime.profile.clock = pickProfileClock();
+        runtime.profile.write_line = profileLine;
+        runtime.profile.deep = options.profile_deep;
     }
     video.init();
     if (options.audio) audio.start();
@@ -133,11 +135,26 @@ fn pickProfileClock() *const fn () u32 {
     pd_mod.log("profile: getElapsedTime {d} -> {d} us over {d} ms ({d} spins): using {s}", .{
         usFromSecs(e0), usFromSecs(e1), ms, spins, if (live) "getElapsedTime (us)" else "getCurrentTimeMilliseconds (ms)",
     });
-    if (live) {
-        sys.resetElapsedTime();
-        return profileClockElapsed;
-    }
-    return profileClockMs;
+    const clock: *const fn () u32 = if (live) profileClockElapsed else profileClockMs;
+    if (live) sys.resetElapsedTime();
+    logClockCost(clock);
+    return clock;
+}
+
+/// The profiler reads the clock twice per timed section (a thousand times
+/// a frame with per-query and per-object timing): log what one read costs,
+/// so the report's per-call figures can be corrected for it.
+fn logClockCost(clock: *const fn () u32) void {
+    const sys = pd_mod.pd.system;
+    const calls = 2000;
+    const m0 = sys.getCurrentTimeMilliseconds();
+    var sink: u32 = 0;
+    for (0..calls) |_| sink +%= clock();
+    std.mem.doNotOptimizeAway(sink);
+    const ms = sys.getCurrentTimeMilliseconds() -% m0;
+    // ms * 1000 / calls = microseconds per read; printed in hundredths.
+    const centi_us = ms * 100_000 / calls;
+    pd_mod.log("profile: clock read costs {d}.{d:0>2} us ({d} reads in {d} ms)", .{ centi_us / 100, centi_us % 100, calls, ms });
 }
 
 /// Seconds -> microseconds, saturating (NaN and negatives give 0).
@@ -145,6 +162,11 @@ fn usFromSecs(secs: f32) u32 {
     if (!(secs > 0.0)) return 0;
     if (secs >= 4294.0) return std.math.maxInt(u32);
     return @intFromFloat(secs * 1_000_000.0);
+}
+
+/// Report lines arrive formatted: straight to the console, no std.fmt.
+fn profileLine(line: [*:0]const u8) void {
+    pd_mod.pd.system.logToConsole("%s", line);
 }
 
 fn profileClockMs() u32 {

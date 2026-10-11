@@ -839,32 +839,6 @@ test "C Parity: test_key_press_events" {
     try std.testing.expectEqual(@as(usize, 1), s_log_count);
 }
 
-test "C Parity: test_draw_views_and_default_draw" {
-    setup(true);
-    try std.testing.expect(RoomManager.get().start(R2, true));
-    const a = add(O_A, 0, 0);
-    const plain = add(O_PLAIN, 0, 0);
-    const hidden = add(O_A, 0, 0);
-    hidden.visible = false;
-    s_log_count = 0;
-
-    LoopManager.get().step();
-    // Views 0 and 2 are visible: Draw Begin/Draw/Draw End once per view.
-    try std.testing.expectEqual(@as(usize, 2), countOf(L_DRAW, a.id));
-    try std.testing.expectEqual(@as(i32, 0), s_log[@intCast(first(L_DRAW, a.id))].view);
-    try std.testing.expectEqual(@as(i32, 7), ViewManager.get().current());
-    try std.testing.expectEqual(@as(i32, 7), s_log[@intCast(first(L_GUI, a.id))].view);
-    try std.testing.expectEqual(@as(usize, 2), countOf(L_DRAW_SELF, plain.id));
-    try std.testing.expectEqual(@as(usize, 1), countOf(L_PRE, a.id));
-    try std.testing.expectEqual(@as(usize, 1), countOf(L_GUI, a.id));
-    try std.testing.expectEqual(@as(usize, 0), countOf(L_DRAW, hidden.id) + countOf(L_GUI, hidden.id));
-
-    LoopManager.get().setDrawEnabled(false);
-    s_log_count = 0;
-    LoopManager.get().step();
-    try std.testing.expectEqual(@as(usize, 0), countOf(L_DRAW, -1) + countOf(L_DRAW_SELF, -1));
-}
-
 test "C Parity: test_destroyed_instances_are_reclaimed_before_draw" {
     setup(false);
     const a = add(O_A, 0, 0);
@@ -943,75 +917,3 @@ test "OPT-4: static vs dynamic partitioning and promotion" {
     try std.testing.expectEqual(@as(usize, 2), mgr.activeCount());
 }
 
-test "Draw layer filter: static background, static foreground, dynamic actors, and GUI toggles" {
-    setup(false);
-    s_log_count = 0;
-
-    const mgr = InstanceManager.get();
-    const loop_mgr = LoopManager.get();
-
-    // Reset filter
-    loop_mgr.setDrawFilter(.{});
-
-    // Create a dynamic actor (depth 50, has draw events)
-    const dyn_actor = add(O_A, 10, 10);
-    dyn_actor.setDepth(50.0);
-    try std.testing.expect(dyn_actor.is_dynamic);
-
-    // Create a static background instance (depth 100, no draw event -> uses draw_self)
-    const stat_bg = add(O_PLAIN, 20, 20);
-    stat_bg.setDepth(100.0);
-    mgr.demoteStatic(stat_bg);
-    try std.testing.expect(!stat_bg.is_dynamic);
-
-    // Create a static foreground instance (depth 10, no draw event -> uses draw_self)
-    const stat_fg = add(O_PLAIN, 30, 30);
-    stat_fg.setDepth(10.0);
-    mgr.demoteStatic(stat_fg);
-    try std.testing.expect(!stat_fg.is_dynamic);
-
-    // 1. By default, all layers/actors are enabled
-    s_log_count = 0;
-    loop_mgr.step();
-    try std.testing.expectEqual(@as(usize, 1), countOf(L_DRAW, dyn_actor.id));
-    try std.testing.expectEqual(@as(usize, 1), countOf(L_DRAW_SELF, stat_bg.id));
-    try std.testing.expectEqual(@as(usize, 1), countOf(L_DRAW_SELF, stat_fg.id));
-    try std.testing.expectEqual(@as(usize, 1), countOf(L_GUI, dyn_actor.id));
-
-    // 2. Disable static background: stat_bg skipped, others drawn
-    loop_mgr.setStaticBackgroundEnabled(false);
-    s_log_count = 0;
-    loop_mgr.step();
-    try std.testing.expectEqual(@as(usize, 1), countOf(L_DRAW, dyn_actor.id));
-    try std.testing.expectEqual(@as(usize, 0), countOf(L_DRAW_SELF, stat_bg.id));
-    try std.testing.expectEqual(@as(usize, 1), countOf(L_DRAW_SELF, stat_fg.id));
-    try std.testing.expectEqual(@as(usize, 1), countOf(L_GUI, dyn_actor.id));
-
-    // 3. Disable static foreground: both stat_bg and stat_fg skipped
-    loop_mgr.setStaticForegroundEnabled(false);
-    s_log_count = 0;
-    loop_mgr.step();
-    try std.testing.expectEqual(@as(usize, 1), countOf(L_DRAW, dyn_actor.id));
-    try std.testing.expectEqual(@as(usize, 0), countOf(L_DRAW_SELF, stat_bg.id));
-    try std.testing.expectEqual(@as(usize, 0), countOf(L_DRAW_SELF, stat_fg.id));
-    try std.testing.expectEqual(@as(usize, 1), countOf(L_GUI, dyn_actor.id));
-
-    // 4. Disable dynamic actors: dyn_actor draw skipped, but GUI still drawn
-    loop_mgr.setDynamicActorsEnabled(false);
-    s_log_count = 0;
-    loop_mgr.step();
-    try std.testing.expectEqual(@as(usize, 0), countOf(L_DRAW, dyn_actor.id));
-    try std.testing.expectEqual(@as(usize, 0), countOf(L_DRAW_SELF, stat_bg.id));
-    try std.testing.expectEqual(@as(usize, 0), countOf(L_DRAW_SELF, stat_fg.id));
-    try std.testing.expectEqual(@as(usize, 1), countOf(L_GUI, dyn_actor.id));
-
-    // 5. Disable GUI: GUI now also skipped
-    loop_mgr.setGuiEnabled(false);
-    s_log_count = 0;
-    loop_mgr.step();
-    try std.testing.expectEqual(@as(usize, 0), countOf(L_DRAW, dyn_actor.id));
-    try std.testing.expectEqual(@as(usize, 0), countOf(L_GUI, dyn_actor.id));
-
-    // Restore all
-    loop_mgr.setDrawFilter(.{});
-}

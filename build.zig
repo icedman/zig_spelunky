@@ -179,6 +179,9 @@ fn addPlaydate(b: *std.Build, test_step: *std.Build.Step) void {
     host_options.addOption(u32, "profile_frames", b.option(u32, "playdate-profile", "Log per-phase frame timings to the console every N frames (default: 0 = off)") orelse 0);
     host_options.addOption(bool, "profile_deep", b.option(bool, "playdate-profile-deep", "With playdate-profile: also time every object event and runtime call (default: true; false = phases and counters only, near-zero overhead)") orelse true);
     host_options.addOption(u32, "display_scale", b.option(u32, "playdate-scale", "Playdate display scale factor (1 = 400x240, 2 = 200x120 2x hardware upscaled, default: 2)") orelse 2);
+    host_options.addOption(bool, "layer_background", b.option(bool, "playdate-layer-bg", "Draw room background layers (images, colour, tiles at depth >= 1000) (default: true)") orelse true);
+    host_options.addOption(bool, "layer_foreground", b.option(bool, "playdate-layer-fg", "Draw room foreground layers (depth < 1000) (default: true)") orelse true);
+    host_options.addOption(u32, "hud_text_scale", b.option(u32, "playdate-hud-text-scale", "Scale of world-pass text, i.e. the HUD numbers (default: 2)") orelse 2);
 
     const sdk_path = sdk orelse {
         const fail = b.addFail("the Playdate SDK was not found: set PLAYDATE_SDK_PATH or pass -Dplaydate-sdk=DIR");

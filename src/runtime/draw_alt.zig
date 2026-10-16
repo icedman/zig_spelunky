@@ -14,6 +14,10 @@ const DrawManager = @import("draw.zig").DrawManager;
 const RoomManager = @import("room.zig").RoomManager;
 const profile = @import("profile.zig");
 const loop_mod = @import("loop.zig");
+const std = @import("std");
+const ObjectRegistry = @import("object.zig").ObjectRegistry;
+const layer_mod = @import("layer.zig");
+const LayerManager = layer_mod.LayerManager;
 const LoopManager = loop_mod.LoopManager;
 
 pub fn drawPipeline(lm: *LoopManager) void {
@@ -25,21 +29,27 @@ pub fn drawPipeline(lm: *LoopManager) void {
     profile.stop(.draw_frame, t);
     vm.update();
 
+    // World-pass text (the HUD) at the host's scale.
+    dm.text_scale = dm.world_text_scale;
     if (vm.enabled()) {
         for (0..VIEW_COUNT) |v| {
             if (vm.getViewVar(ViewField.visible, v) == 0.0) continue;
             vm.setCurrent(@intCast(v));
             dm.passView(v);
-            followTarget(dm, vm, v);
+            const pin = followTarget(dm, vm, v);
             drawObjects(lm);
+            pin.restore();
         }
         vm.setCurrent(7);
     } else {
         vm.setCurrent(0);
         dm.passRoom();
+        const pin = followTarget(dm, vm, 0);
         drawObjects(lm);
+        pin.restore();
     }
 
+    dm.text_scale = 1.0;
     if (lm.draw_filter.gui) {
         t = profile.start();
         dm.passGui();
@@ -51,15 +61,57 @@ pub fn drawPipeline(lm: *LoopManager) void {
     profile.stop(.draw_frame, t);
 }
 
+/// The game camera moved by `followTarget` for one world pass; `restore`
+/// puts it back, so step logic only ever sees the game's own camera.
+const CameraPin = struct {
+    cam: ?*view_mod.Camera = null,
+    x: f32 = 0.0,
+    y: f32 = 0.0,
+
+    fn restore(self: CameraPin) void {
+        if (self.cam) |c| {
+            c.x = self.x;
+            c.y = self.y;
+        }
+    }
+};
+
+/// oPlayer1's object index (null if the game has none), looked up once per
+/// installed object table.
+fn playerObject() ?i32 {
+    const S = struct {
+        var table: ?[*]const @import("object.zig").ObjectDef = null;
+        var obj: ?i32 = null;
+    };
+    const reg = ObjectRegistry.get();
+    if (S.table != reg.defs) {
+        S.table = reg.defs;
+        S.obj = null;
+        for (0..reg.countObjects()) |i| {
+            const def = reg.getDef(@intCast(i)) orelse continue;
+            if (std.mem.eql(u8, def.name, "oPlayer1")) {
+                S.obj = @intCast(i);
+                break;
+            }
+        }
+    }
+    return S.obj;
+}
+
 /// HACK: when the host shows only a centred `follow_w` x `follow_h` window
-/// of the frame (Playdate 2x), shift the view so its follow object sits in
-/// the middle of that window, clamped to the room, and cull to the window.
-/// The view's scale is kept; the game's own camera is not touched.
-fn followTarget(dm: *DrawManager, vm: *ViewManager, v: usize) void {
-    if (dm.follow_w <= 0 or dm.follow_h <= 0) return;
+/// of the frame (Playdate 2x), shift the view so the player (else the
+/// view's follow object) sits in the middle of that window, clamped to the
+/// room, and cull to the window. The view's scale is kept.
+///
+/// For the world pass the view's camera is moved to the window's top-left:
+/// view-relative draws (the HUD at camera x + 8, y + 8) then sit at the top
+/// left of the screen instead of sliding with the follow. The returned pin
+/// restores the camera after the pass.
+fn followTarget(dm: *DrawManager, vm: *ViewManager, v: usize) CameraPin {
+    if (dm.follow_w <= 0 or dm.follow_h <= 0) return .{};
     const sx = dm.xf.sx;
     const sy = dm.xf.sy;
-    if (!(sx > 0.0 and sy > 0.0)) return;
+    if (!(sx > 0.0 and sy > 0.0)) return .{};
 
     const app_w: f32 = @floatFromInt(dm.app_w);
     const app_h: f32 = @floatFromInt(dm.app_h);
@@ -76,9 +128,12 @@ fn followTarget(dm: *DrawManager, vm: *ViewManager, v: usize) void {
     var wx = (win_x - dm.xf.tx) / sx;
     var wy = (win_y - dm.xf.ty) / sy;
 
-    const obj: i32 = @intFromFloat(vm.getViewVar(ViewField.object, v));
-    if (obj >= 0) {
-        if (InstanceManager.get().find(obj, 0, null, null)) |t| {
+    const mgr = InstanceManager.get();
+    const player: ?*Instance = if (playerObject()) |p| mgr.find(p, 0, null, null) else null;
+    const view_obj: i32 = @intFromFloat(vm.getViewVar(ViewField.object, v));
+    const target: ?*Instance = player orelse if (view_obj >= 0) mgr.find(view_obj, 0, null, null) else null;
+    {
+        if (target) |t| {
             const has_bbox = t.bbox_right > t.bbox_left and t.bbox_bottom > t.bbox_top;
             const px = if (has_bbox) (t.bbox_left + t.bbox_right) * 0.5 else t.x;
             const py = if (has_bbox) (t.bbox_top + t.bbox_bottom) * 0.5 else t.y;
@@ -100,6 +155,15 @@ fn followTarget(dm: *DrawManager, vm: *ViewManager, v: usize) void {
     dm.xf.wy = (win_y - dm.xf.ty) / sy;
     dm.xf.ww = ww;
     dm.xf.wh = wh;
+
+    // Exactly the window's top-left in world units (from the rounded
+    // offset), so camera-relative draws land on whole screen pixels.
+    const cam_id: i32 = @intFromFloat(vm.getViewVar(ViewField.camera, v));
+    const cam = vm.cameraGet(cam_id) orelse return .{};
+    const pin: CameraPin = .{ .cam = cam, .x = cam.x, .y = cam.y };
+    cam.x = dm.xf.wx;
+    cam.y = dm.xf.wy;
+    return pin;
 }
 
 inline fn drawable(inst: *const Instance) bool {
@@ -128,8 +192,38 @@ fn offscreen(dm: *const DrawManager, mgr: *InstanceManager, inst: *const Instanc
     return if (box) |b| dm.boxOffscreen(b, cull_margin) else false;
 }
 
+/// Room layers (background images / colour, tiles) merged into the instance
+/// pass by depth, deepest first. Instance layers hold nothing to draw.
+const Layers = struct {
+    lm: *LoopManager,
+    /// Next layer to draw, walking from the deepest (highest index) down.
+    next: isize,
+
+    fn init(lm: *LoopManager) Layers {
+        const on = lm.draw_filter.layer_background or lm.draw_filter.layer_foreground;
+        return .{ .lm = lm, .next = if (on) @as(isize, @intCast(LayerManager.get().count())) - 1 else -1 };
+    }
+
+    /// Draws every layer at or behind `depth` (null: all that are left).
+    fn drawUpTo(self: *Layers, dm: *DrawManager, depth: ?i32) void {
+        if (self.next < 0) return;
+        const t = profile.start();
+        defer profile.stop(.draw_layers, t);
+        const layers = LayerManager.get();
+        const f = self.lm.draw_filter;
+        while (self.next >= 0) : (self.next -= 1) {
+            const l = layers.at(@intCast(self.next)) orelse continue;
+            if (depth) |d| if (l.depth < d) return;
+            if (l.kind == layer_mod.LAYER_INSTANCES) continue;
+            const is_bg = @as(f32, @floatFromInt(l.depth)) >= f.bg_depth_threshold;
+            if (if (is_bg) f.layer_background else f.layer_foreground) dm.drawLayer(l);
+        }
+    }
+};
+
 /// Instances come back from `drawOrder` already sorted by depth (cached depth
-/// buckets), so this is a single linear pass.
+/// buckets), so this is a single linear pass; room layers are drawn in
+/// between, by depth.
 fn drawObjects(lm: *LoopManager) void {
     const dm = DrawManager.get();
     const rm = RoomManager.get();
@@ -137,12 +231,16 @@ fn drawObjects(lm: *LoopManager) void {
     const n = InstanceManager.get().drawOrder(&lm.draw_scratch);
     profile.stop(.draw_order, t);
 
+    var layers = Layers.init(lm);
+    defer layers.drawUpTo(dm, null);
+
     t = profile.start();
     defer profile.stop(.draw_instances, t);
     const prof = profile.deepEnabled();
     const mgr = InstanceManager.get();
     for (lm.draw_scratch[0..n]) |inst| {
         const slot = mgr.slot(inst);
+        if (layers.next >= 0) layers.drawUpTo(dm, mgr.drawDepth(inst));
         // Static instance with a cached box: culled from the compact table,
         // without reading the instance.
         if (mgr.cull_state[slot] == .box and dm.boxOffscreen(mgr.cull_box[slot], cull_margin)) {

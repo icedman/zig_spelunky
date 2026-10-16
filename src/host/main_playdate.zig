@@ -91,10 +91,13 @@ fn init(playdate: *api.PlaydateAPI) void {
     // The screen is the frame buffer and each frame starts with a clear, so
     // screen draws from step events (oScreen's full-screen blit) never show.
     runtime.DrawManager.get().skip_unseen = true;
+    runtime.LoopManager.get().setLayerBackgroundEnabled(options.layer_background);
+    runtime.LoopManager.get().setLayerForegroundEnabled(options.layer_foreground);
+    runtime.DrawManager.get().world_text_scale = @floatFromInt(@max(options.hud_text_scale, 1));
     pd_mod.log("host: booted ({d} instances max), room {s}", .{ runtime.instance.MAX_INSTANCES, app.roomName() });
     ready = true;
 
-    playdate.display.setRefreshRate(60.0);
+    playdate.display.setRefreshRate(30.0);
     playdate.system.setUpdateCallback(update, null);
 }
 

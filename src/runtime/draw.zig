@@ -125,6 +125,11 @@ pub const DrawManager = struct {
     /// follow object and cull to this window. 0 = off.
     follow_w: i32 = 0,
     follow_h: i32 = 0,
+    /// HACK (draw_alt): extra scale of text drawn in the world pass (the
+    /// HUD); GUI text is unaffected.
+    world_text_scale: f32 = 1.0,
+    /// Scale applied to draw_text right now (set by the draw pipeline).
+    text_scale: f32 = 1.0,
 
     win_w: i32 = 640,
     win_h: i32 = 480,
@@ -620,7 +625,7 @@ pub const DrawManager = struct {
         switch (font) {
             .host => |handle| {
                 const text_fn = self.backend.draw_text_fn orelse return;
-                text_fn(self.backend.user_data, handle, text, tx, ty, self.xf.sx, self.colour, self.alpha);
+                text_fn(self.backend.user_data, handle, text, tx, ty, self.xf.sx * self.text_scale, self.colour, self.alpha);
             },
             .sprite => |sf| self.drawSpriteText(sf, tx, ty, std.mem.span(text)),
         }
@@ -633,8 +638,10 @@ pub const DrawManager = struct {
     fn drawSpriteText(self: *DrawManager, sf: SpriteFont, x: f32, y: f32, text: []const u8) void {
         const draw_fn = self.backend.draw_image_fn orelse return;
         const g = self.glyphs(sf.sprite) orelse return;
-        const adv = @as(f32, @floatFromInt(g.w)) * self.xf.sx;
-        const line = @as(f32, @floatFromInt(g.h)) * self.xf.sy;
+        const sx = self.xf.sx * self.text_scale;
+        const sy = self.xf.sy * self.text_scale;
+        const adv = @as(f32, @floatFromInt(g.w)) * sx;
+        const line = @as(f32, @floatFromInt(g.h)) * sy;
         var lx = x;
         var ly = y;
         var i: usize = 0;
@@ -647,7 +654,7 @@ pub const DrawManager = struct {
                 continue;
             }
             if (glyphIndex(sf.first, g.frames, ch)) |frame| {
-                draw_fn(self.backend.user_data, sf.sprite, frame, 0, 0, g.w, g.h, lx, ly, 0.0, 0.0, self.xf.sx, self.xf.sy, 0.0, self.colour, self.alpha);
+                draw_fn(self.backend.user_data, sf.sprite, frame, 0, 0, g.w, g.h, lx, ly, 0.0, 0.0, sx, sy, 0.0, self.colour, self.alpha);
             }
             lx += adv;
         }

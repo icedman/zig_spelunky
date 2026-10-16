@@ -956,6 +956,12 @@ pub const InstanceManager = struct {
         return (addr - base) / @sizeOf(Instance);
     }
 
+    /// The depth `inst` is drawn at: its bucket's depth (exact for every
+    /// depth in `bucket_depths`), from the slot table without reading `inst`.
+    pub inline fn drawDepth(self: *const InstanceManager, inst: *const Instance) i32 {
+        return bucket_depths[self.depth_bucket[self.slot(inst)]];
+    }
+
     /// True if `inst` lives in the instance pool.
     pub fn owns(self: *const InstanceManager, inst: *const Instance) bool {
         const base = @intFromPtr(&self.pool[0]);

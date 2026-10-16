@@ -130,6 +130,11 @@ pub const DrawLayerFilter = struct {
     gui: bool = true,
     bg_depth_threshold: f32 = 1000.0,
     cull_offscreen: bool = true,
+    /// Room layers (background images, colour, tiles) at or behind
+    /// `bg_depth_threshold` (draw_alt pipeline).
+    layer_background: bool = true,
+    /// Room layers in front of `bg_depth_threshold` (draw_alt pipeline).
+    layer_foreground: bool = true,
 };
 
 pub const LoopManager = struct {
@@ -837,6 +842,14 @@ pub const LoopManager = struct {
 
     pub fn setGuiEnabled(self: *LoopManager, enabled: bool) void {
         self.draw_filter.gui = enabled;
+    }
+
+    pub fn setLayerBackgroundEnabled(self: *LoopManager, enabled: bool) void {
+        self.draw_filter.layer_background = enabled;
+    }
+
+    pub fn setLayerForegroundEnabled(self: *LoopManager, enabled: bool) void {
+        self.draw_filter.layer_foreground = enabled;
     }
 
     pub fn frameCount(self: *const LoopManager) usize {
